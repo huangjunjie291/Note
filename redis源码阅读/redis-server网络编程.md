@@ -174,5 +174,109 @@ typedef struct aeEventLoop {
 
 ---
 
-## 二、其他细节
+## 二、信号处理
+
+上面说到，全局变量struct redisServer server; 可以看做整个服务器的封装，服务器启动后需要初始化，在initServer();函数中对其初始化，此函数中一进入便对几个信号做了相关处理。
+
+```c
+void initServer(void) {
+    int j;
+
+    signal(SIGHUP, SIG_IGN);
+    signal(SIGPIPE, SIG_IGN);
+    setupSignalHandlers();
+    ....
+}
+```
+
+这里面对**SIGHUP**和**SIGPIPE**做了忽略处理，为什么要忽略这两个信号呢？
+
+首先，先了解**进程组**和**会话**。
+
+- 进程组：
+
+  进程组就是一组相互关联的进程集合，系统中每一个进程都从属于某个进程组。每个进程组有唯一的PGID（Process group ID），PGID一般等于创建进程组的进程PID（Process ID）。每个进程组有一个首领进程（process group leader），除了首领进程外其余的都是子进程。
+
+- 会话：
+
+  会话就是一些进程组的集合，系统中的每个进程组都从属于某个会话。
+
+  一个会话**最多**可以有一个**控制终端**（比如linux中的terminal），该终端为会话中所有的进程组共用。
+
+  一个会话中**只会有**一个**前台进程组**，除此之外都是后台进程组，只有前台进程组才能和终端交互。
+
+  类似于进程组，**会话中也有首领（session leader），也可以叫做控制进程（注意这是个进程，不是组），表示连接终端的进程。**一般就是登入系统的shell进程。
+
+![会话](/home/hjj/Note/redis源码阅读/images/会话.jpg)
+
+> 示例：
+>
+>  hjj@HuanG>    sleep 50 &
+> 	[1] 3280
+> hjj@HuanG>     ps j 3280 $$
+>    PPID     PID    PGID     SID TTY        TPGID STAT   UID   TIME COMMAND
+>    1639    1676    1676    1676 pts/0       3288 Ss    1000   0:00 zsh
+>    1676    3280    3280    1676 pts/0       3288 SN    1000   0:00 sleep 50
+
+PPID是父进程PID，PID是进程ID，PGID是进程组ID，SID是会话ID。TTY是会话控制终端设备。TPGID是前台进程组ID。
+
+---
+
+**2.1 SIGHUP信号**
+
+以上对进程组和会话有了解后，再来看SIGHUP信号。
+
+SIGHUP信号在终端连接结束（无论正常结束还是异常结束）时发出，通知同一个会话内的各个作业。
+
+- 终端关闭时，SIGHUP信号发送给session首领进程（一般是shell进程）和使用&提交的后台运行进程（如上面示例中的sleep 50 &）。
+- session首领进程关闭时，会发送SIGHUP信号给前台进程组的每一个进程。
+- 若一个父进程退出了，导致进程组成为孤儿进程组，且该进程组中有进程处于停止状态（收到SIGSTOP或SIGTSTP信号），SIGHUP信号会被发送到该进程组中的每一个进程。
+
+**比如，我们在登录Linux系统后，系统会给我们用户分配一个终端，会话中的首领进程表示连接终端的进程（如shell），我们在这个终端里运行各种程序，有前台进程组，后台进程组，他们都属于这个session。当我们用户登出linux后，前台进程组和后台有对终端输出的进程将会收到SIGHUP信号。而SIGHUP信号的默认操作是终止进程。**
+
+可以用上面的示例再试一下，开启一个终端，输入sleep 50 &，然后把这个终端关闭，这时候再输入ps j 【对应的进程PID】 $$是找不到sleep进程的，它被终止了。所以，我们编写服务器程序，通过shell启用服务程序，肯定不想在shell关闭时将程序关闭而使服务停掉，所以一般使用signal(SIGHUP, SIG_IGN);将SIGHUP信号忽略。
+
+**2.2 SIGPIPE信号**
+
+当往一个写端关闭的管道(pipe)或socket连接中连续写入数据时会引发SIGPIPE信号，并且写操作将设置errno为EPIPE。
+
+在使用TCP的通信中，当通信双方中的一方close时，如果另一方接着发数据，根据TCP协议的规定，先会收到一个RST响应报文，之后如果还向这个socket发送数据时，系统会发出一个SIGPIPE信号给进程，告诉进程这个连接已经断开了，不能再写入数据。
+
+SIGPIPE的默认操作是终止进程，而对于一个服务器程序，我们不想当客户端关闭时，我们仍然向客户端写数据而引发SIGPIPE就是进程关闭停止服务。所以一般使用signal(SIGPIPE,SIG_IGN);将SIGPIPE信号忽略。
+
+---
+
+后面继续看setupSignalHandlers()函数对其他信号的处理。
+
+```C
+void setupSignalHandlers(void) {
+    struct sigaction act;
+
+    /* When the SA_SIGINFO flag is set in sa_flags then sa_sigaction is used.
+     * Otherwise, sa_handler is used. */
+    sigemptyset(&act.sa_mask);
+    act.sa_flags = 0;
+    act.sa_handler = sigShutdownHandler;
+    sigaction(SIGTERM, &act, NULL);
+    sigaction(SIGINT, &act, NULL);
+
+    sigemptyset(&act.sa_mask);
+    act.sa_flags = SA_NODEFER | SA_RESETHAND | SA_SIGINFO;
+    act.sa_sigaction = sigsegvHandler;
+    if(server.crashlog_enabled) {
+        sigaction(SIGSEGV, &act, NULL);
+        sigaction(SIGBUS, &act, NULL);
+        sigaction(SIGFPE, &act, NULL);
+        sigaction(SIGILL, &act, NULL);
+        sigaction(SIGABRT, &act, NULL);
+    }
+    return;
+}
+```
+
+signal api用法：
+
+
+
+## 三、定时器
 
