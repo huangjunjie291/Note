@@ -409,6 +409,131 @@ Proactor的异步IO，感知的是**已完成的读写事件（接到通知后�
 
 ---
 
+## 三、高性能网络服务器编程模型示例
+
+当前一些高性能服务器编程多采用Reactor模式，服务器Server中封装一个不断循环的EventLoop，而EventLoop中包含IO多路复用技术的封装，以及定时事件的处理等，如下图：
+
+![网络编程模型](/home/hjj/Note/linux网络编程/images/网络编程模型.jpg)
+
+以muduo网络库和redis为例来看
+
+1、muduo网络库例子：
+
+```C
+class TcpServer : noncopyable
+{
+ public:
+  typedef std::function<void(EventLoop*)> ThreadInitCallback;
+   // .......省略.......
+  TcpServer(EventLoop* loop,
+            const InetAddress& listenAddr,
+            const string& nameArg,
+            Option option = kNoReusePort);
+  ~TcpServer();  // force out-line dtor, for std::unique_ptr members.
+  const string& ipPort() const { return ipPort_; }
+  const string& name() const { return name_; }
+  EventLoop* getLoop() const { return loop_; }
+
+  //.......省略.......
+  EventLoop* loop_;  // the acceptor loop
+};
+```
+
+可以看到TcpServer这个服务器类中包含一个EventLoop，而EventLoop构造函数如下：
+
+```C
+EventLoop::EventLoop()
+  : looping_(false),
+    quit_(false),
+    eventHandling_(false),
+    callingPendingFunctors_(false),
+    iteration_(0),
+    threadId_(CurrentThread::tid()),
+    poller_(Poller::newDefaultPoller(this)),
+    timerQueue_(new TimerQueue(this)),
+    wakeupFd_(createEventfd()),
+    wakeupChannel_(new Channel(this, wakeupFd_)),
+    currentActiveChannel_(NULL)
+{
+  LOG_DEBUG << "EventLoop created " << this << " in thread " << threadId_;
+  if (t_loopInThisThread)
+  {
+    LOG_FATAL << "Another EventLoop " << t_loopInThisThread
+              << " exists in this thread " << threadId_;
+  }
+  else
+  {
+    t_loopInThisThread = this;
+  }
+  wakeupChannel_->setReadCallback(
+      std::bind(&EventLoop::handleRead, this));
+  // we are always reading the wakeupfd
+  wakeupChannel_->enableReading();
+}
+```
+
+内含的poller_(Poller::newDefaultPoller(this))即为IO多路技术的封装。timerQueue_为定时器队列，currentActiveChannel_为被激活事件。
+
+
+
+2、redis例子：
+
+首先封装了一个Server全局变量
+
+```C
+struct redisServer server; /* Server global state */
+```
+
+Server中包含一个EventLoop：
+
+```C
+struct redisServer {
+    /* General */
+    //...省略...
+    aeEventLoop *el;
+    //...省略...
+};
+server.el = aeCreateEventLoop(server.maxclients+CONFIG_FDSET_INCR); //EventLoop初始化
+```
+
+而EventLoop中就包含了上图中所说的IO多路技术封装，以及注册的IO读写事件，定时事件等：
+
+```C
+/* State of an event based program */
+typedef struct aeEventLoop {
+    int maxfd;   /* highest file descriptor currently registered */
+    int setsize; /* max number of file descriptors tracked */
+    long long timeEventNextId;
+    aeFileEvent *events; /* Registered events */ //注册的IO事件
+    aeFiredEvent *fired; /* Fired events */   //被激活的IO事件
+    aeTimeEvent *timeEventHead; //定时器事件
+    int stop;
+    void *apidata; /* This is used for polling API specific data */ //指向具体使用哪种IO多路复用技术
+    aeBeforeSleepProc *beforesleep;
+    aeBeforeSleepProc *aftersleep;
+    int flags;
+} aeEventLoop;
+```
+
+而主程序就是不断循环这个EventLoop：
+
+```C
+aeMain(server.el);
+
+void aeMain(aeEventLoop *eventLoop) {
+    eventLoop->stop = 0;
+    while (!eventLoop->stop) {
+        aeProcessEvents(eventLoop, AE_ALL_EVENTS|
+                                   AE_CALL_BEFORE_SLEEP|
+                                   AE_CALL_AFTER_SLEEP);
+    }
+}
+```
+
+**通过以上两个例子了解当前基本的高性能网络编程的模型**。
+
+---
+
 for myself：
 
 **"linux网络编程"~把这几个词拆开，要学习linux相关知识（基本操作，计算机系统等等），网络相关知识（网络协议栈等），编程（如C/C++语言，linux环境下的编程api，学习优秀开源代码）。**
